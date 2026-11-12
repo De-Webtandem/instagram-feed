@@ -1,0 +1,78 @@
+name: Instagram-sync
+
+on:
+  schedule:
+    - cron: '23 * * * *'   # elk uur; GitHub start soms een paar minuten later
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Alles opnieuw maken en publiceren
+        type: boolean
+        default: false
+
+concurrency:
+  group: instagram-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PAGES_URL: ${{ vars.PAGES_URL }}              # bijv. https://dewebtandem-instagram.pages.dev
+      PAGES_PROJECT: ${{ vars.PAGES_PROJECT }}      # bijv. dewebtandem-instagram
+      INSTAGRAM_VIDEO: ${{ vars.INSTAGRAM_VIDEO || '1' }}   # 0 = alleen stilstaande beelden (noodschakelaar)
+      HC_URL: ${{ secrets.HEALTHCHECK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Synchroniseren
+        id: sync
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: |
+          set +e
+          python3 sync.py sync --check --prev "$PAGES_URL" --out out $FORCE; rc=$?
+          if [ $rc -eq 0 ] && grep -q '^nodig=true' "$GITHUB_OUTPUT"; then
+            command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null; }
+            python3 sync.py sync --prev "$PAGES_URL" --out out $FORCE; rc=$?
+          fi
+          if [ $rc -eq 75 ]; then
+            echo "::warning::Tijdelijke storing; de live feed blijft staan. Healthchecks alarmeert pas als dit 24 uur aanhoudt."
+            echo "tijdelijk=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit $rc
+
+      - name: Publiceren naar Cloudflare Pages
+        if: steps.sync.outputs.changed == 'true' && steps.sync.outputs.tijdelijk != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 pages deploy out --project-name="$PAGES_PROJECT" --branch=main --commit-dirty=true
+
+      - name: Live controleren
+        if: steps.sync.outputs.changed == 'true' && steps.sync.outputs.tijdelijk != 'true'
+        run: |
+          ok=
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS "$PAGES_URL/feed.json?t=$(date +%s)" | cmp -s - out/feed.json; then ok=1; break; fi
+            sleep 10
+          done
+          [ -n "$ok" ] || { echo "::error::Live feed.json komt niet overeen met deze deploy"; exit 1; }
+          for f in $(jq -r '.posts[] | .src, (.poster // empty)' out/feed.json); do
+            curl -fsSI "$PAGES_URL/$f" >/dev/null || { echo "::error::$f ontbreekt live"; exit 1; }
+          done
+          echo "Live feed en alle $(jq '.posts | length' out/feed.json) posts bereikbaar."
+
+      - name: Hartslag (Healthchecks)
+        if: success() && steps.sync.outputs.tijdelijk != 'true'
+        run: '[ -z "$HC_URL" ] || curl -fsS -m 10 --retry 3 "$HC_URL" >/dev/null'
+
+      - name: Alarm (Healthchecks)
+        if: failure()
+        run: '[ -z "$HC_URL" ] || curl -fsS -m 10 --retry 3 "$HC_URL/fail" >/dev/null'

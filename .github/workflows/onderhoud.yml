@@ -1,0 +1,50 @@
+name: Onderhoud
+
+on:
+  schedule:
+    - cron: '41 4 * * 1'   # elke maandag
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  token:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instagram-token verlengen (weer 60 dagen)
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_ONDERHOUD_PAT }}
+        run: |
+          python3 sync.py refresh --token-out "$RUNNER_TEMP/tok"
+          gh secret set IG_TOKEN --repo "$GITHUB_REPOSITORY" < "$RUNNER_TEMP/tok"
+          rm -f "$RUNNER_TEMP/tok"
+
+  verbruik:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: GitHub Actions-verbruik van de organisatie (waarschuwing boven 1500 van 2000 min)
+        env:
+          GH_TOKEN: ${{ secrets.GH_ONDERHOUD_PAT }}
+        run: gh api "orgs/$GITHUB_REPOSITORY_OWNER/settings/billing/usage" | python3 sync.py usage --limit 1500
+
+  keepalive:
+    # Alleen bij een publieke repo: GitHub zet geplande workflows uit na 60 dagen zonder activiteit.
+    if: ${{ !github.event.repository.private }}
+    permissions:
+      contents: write   # alleen deze job mag committen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          date -u +%F > .laatst-actief
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .laatst-actief
+          git commit -qm 'Keepalive' && git push -q || echo 'niets te committen'
